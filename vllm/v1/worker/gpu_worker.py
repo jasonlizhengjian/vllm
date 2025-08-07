@@ -179,6 +179,8 @@ class Worker(WorkerBase):
 
     def init_device(self):
         if self.device_config.device.type == "cuda":
+            current_platform.set_cpu_affinity(self.local_rank)
+
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             if (
