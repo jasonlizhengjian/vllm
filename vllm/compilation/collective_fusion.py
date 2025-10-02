@@ -301,6 +301,81 @@ class CutlassScaledMMReduceScatterPattern(BasePattern):
                                 pm.fwd_only, pm_pass)
 
 
+class CutlassScaledFP4MMReduceScatterPattern(BasePattern):
+
+    def get_inputs(self):
+        # FP4 uses uint8 packed format (2 FP4 values per byte)
+        input = torch.empty([16, 8], device=self.device, dtype=torch.uint8)
+        mm_weight = torch.empty([16, 8], device=self.device,
+                                dtype=torch.uint8).contiguous().transpose(
+                                    0, 1)
+        # FP4 uses blockwise scales (float8_e4m3fn)
+        scale_a = torch.empty([16, 1],
+                              device=self.device,
+                              dtype=torch.float8_e4m3fn)
+        scale_b = torch.empty([1, 16],
+                              device=self.device,
+                              dtype=torch.float8_e4m3fn)
+        # FP4 requires alpha parameter
+        alpha = torch.tensor(1.0, device=self.device, dtype=torch.float32)
+
+        cutlass_mm_output = torch.empty([16, 16],
+                                        device=self.device,
+                                        dtype=self.dtype)
+        return [input, mm_weight, scale_a, scale_b, alpha, cutlass_mm_output]
+
+    def register(self, pm_pass: PatternMatcherPass):
+
+        def pattern(input: torch.Tensor, weight: torch.Tensor,
+                    scale_a: torch.Tensor, scale_b: torch.Tensor,
+                    alpha: torch.Tensor,
+                    cutlass_mm_output: torch.Tensor) -> torch.Tensor:
+            cutlass_scaled_fp4_mm = torch.ops.higher_order.auto_functionalized(
+                torch.ops._C.cutlass_scaled_fp4_mm.default,
+                out=cutlass_mm_output,
+                a=input,
+                b=weight,
+                a_sf=scale_a,
+                b_sf=scale_b,
+                alpha=alpha)
+
+            reduce_scatter = torch.ops.vllm.reduce_scatter.default(
+                cutlass_scaled_fp4_mm[1],
+                dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name)
+            return reduce_scatter
+
+        def replacement(input: torch.Tensor, mat2: torch.Tensor,
+                        scale_a: torch.Tensor, scale_b: torch.Tensor,
+                        alpha: torch.Tensor,
+                        cutlass_mm_output: torch.Tensor) -> torch.Tensor:
+            # Try naive approach: use fused_scaled_matmul_reduce_scatter
+            # even though it's designed for FP8
+            output_shape = [*input.shape[:-1], mat2.shape[1]]
+            scatter_dim = 0
+            gemm_rs = torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter(
+                input,
+                mat2,
+                scale_a,
+                scale_b,
+                "avg",
+                scatter_dim,  # orig_scatter_dim
+                scatter_dim,  # scatter_dim_after_maybe_reshape
+                self.tp.device_group.group_name,
+                output_shape,
+                None,  # bias
+                None,  # result_scale
+                self.dtype,  # out_dtype
+                False,  # use_fast_accum
+            )
+
+            return gemm_rs
+
+        pm.register_replacement(pattern, replacement, self.get_inputs(),
+                                pm.fwd_only, pm_pass)
+
+
 class AllGatherCutlassScaledMMPattern(BasePattern):
 
     def get_inputs(self):
@@ -392,6 +467,10 @@ class AsyncTPPass(VllmPatternMatcherPass):
             CutlassScaledMMReduceScatterPattern(
                 self.model_dtype, self.device).register(self.patterns)
             AllGatherCutlassScaledMMPattern(
+                self.model_dtype, self.device).register(self.patterns)
+
+            # Experimental: Try FP4 fusion
+            CutlassScaledFP4MMReduceScatterPattern(
                 self.model_dtype, self.device).register(self.patterns)
 
         self.dump_patterns(config, self.patterns)
