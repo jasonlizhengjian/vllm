@@ -208,17 +208,11 @@ class FirstAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
 
     def __init__(self, epsilon: float, dtype: torch.dtype, device: str):
         super().__init__(epsilon, dtype, device)
-        self.rmsnorm_matcher = MatcherRMSNorm(epsilon)
-        self.quant_matcher = MatcherQuant(kFp8StaticTensorSym)
-
-    def get_inputs(self):
-        return [
-            *self.rmsnorm_matcher.inputs(),  # input, weight
-            torch.tensor(1.0, device=self.device,
-                         dtype=torch.float32),  # scale
-        ]
 
     def register(self, pm_pass: PatternMatcherPass):
+        # Create matchers lazily here when vllm config is available
+        rmsnorm_matcher = MatcherRMSNorm(self.epsilon)
+        quant_matcher = MatcherQuant(kFp8StaticTensorSym)
 
         def pattern(
             input: torch.Tensor,
@@ -226,8 +220,8 @@ class FirstAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             scale: torch.Tensor,
         ):
             all_reduce = self._all_reduce(input)
-            rmsnorm_output = self.rmsnorm_matcher(all_reduce, weight)
-            quant_output, _ = self.quant_matcher(rmsnorm_output, scale)
+            rmsnorm_output = rmsnorm_matcher(all_reduce, weight)
+            quant_output, _ = quant_matcher(rmsnorm_output, scale)
             return quant_output, all_reduce
 
         def replacement(
@@ -236,12 +230,16 @@ class FirstAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             scale: torch.Tensor,
         ):
             reduce_scatter = self._reduce_scatter(input)
-            rmsnorm_output = self.rmsnorm_matcher(reduce_scatter, weight)
-            quant_output, _ = self.quant_matcher(rmsnorm_output, scale)
+            rmsnorm_output = rmsnorm_matcher(reduce_scatter, weight)
+            quant_output, _ = quant_matcher(rmsnorm_output, scale)
             all_gather = self._all_gather(quant_output)
             return all_gather, reduce_scatter
 
-        inputs = self.get_inputs()
+        inputs = [
+            *rmsnorm_matcher.inputs(),  # input, weight
+            torch.tensor(1.0, device=self.device,
+                         dtype=torch.float32),  # scale
+        ]
         pattern(*inputs)  # Trace the pattern
 
         pm.register_replacement(pattern, replacement, inputs, pm.fwd_only,
@@ -252,17 +250,11 @@ class MiddleAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
 
     def __init__(self, epsilon: float, dtype: torch.dtype, device: str):
         super().__init__(epsilon, dtype, device)
-        self.rmsnorm_matcher = MatcherFusedAddRMSNorm(epsilon)
-        self.quant_matcher = MatcherQuant(kFp8StaticTensorSym)
-
-    def get_inputs(self):
-        mm_1 = torch.empty([4, 4], device=self.device, dtype=self.dtype)
-        residual = torch.empty([4, 4], device=self.device, dtype=self.dtype)
-        weight = torch.empty([4, 4], device=self.device, dtype=self.dtype)
-        scale = torch.empty([1, 1], device=self.device, dtype=torch.float32)
-        return [mm_1, residual, weight, scale]
 
     def register(self, pm_pass: PatternMatcherPass):
+        # Create matchers lazily here when vllm config is available
+        rmsnorm_matcher = MatcherFusedAddRMSNorm(self.epsilon)
+        quant_matcher = MatcherQuant(kFp8StaticTensorSym)
 
         def pattern(
             mm_1: torch.Tensor,
@@ -271,9 +263,9 @@ class MiddleAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             all_reduce = self._all_reduce(mm_1)
-            rmsnorm_output, residual_output = self.rmsnorm_matcher(
+            rmsnorm_output, residual_output = rmsnorm_matcher(
                 all_reduce, weight, residual)
-            quant_output, _ = self.quant_matcher(rmsnorm_output, scale)
+            quant_output, _ = quant_matcher(rmsnorm_output, scale)
             return quant_output, residual_output
 
         def replacement(
@@ -283,13 +275,21 @@ class MiddleAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             reduce_scatter = self._reduce_scatter(mm_1)
-            rmsnorm_output, residual_output = self.rmsnorm_matcher(
+            rmsnorm_output, residual_output = rmsnorm_matcher(
                 reduce_scatter, weight, residual)
-            quant_output, _ = self.quant_matcher(rmsnorm_output, scale)
+            quant_output, _ = quant_matcher(rmsnorm_output, scale)
             all_gather = self._all_gather(quant_output)
             return all_gather, residual_output
 
-        inputs = self.get_inputs()
+        inputs = [
+            torch.empty([4, 4], device=self.device, dtype=self.dtype),  # mm_1
+            torch.empty([4, 4], device=self.device,
+                        dtype=self.dtype),  # residual
+            torch.empty([4, 4], device=self.device,
+                        dtype=self.dtype),  # weight
+            torch.empty([1, 1], device=self.device,
+                        dtype=torch.float32),  # scale
+        ]
         pattern(*inputs)  # Trace the pattern
 
         pm.register_replacement(pattern, replacement, inputs, pm.fwd_only,
@@ -300,17 +300,11 @@ class LastAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
 
     def __init__(self, epsilon: float, dtype: torch.dtype, device: str):
         super().__init__(epsilon, dtype, device)
-        self.rmsnorm_matcher = MatcherFusedAddRMSNorm(epsilon)
-        self.quant_matcher = MatcherQuant(kFp8StaticTensorSym)
-
-    def get_inputs(self):
-        mm_1 = torch.empty([4, 4], device=self.device, dtype=self.dtype)
-        residual = torch.empty([4, 4], device=self.device, dtype=self.dtype)
-        weight = torch.empty([4, 4], device=self.device, dtype=self.dtype)
-        scale = torch.empty([1, 1], device=self.device, dtype=torch.float32)
-        return [mm_1, residual, weight, scale]
 
     def register(self, pm_pass: PatternMatcherPass):
+        # Create matchers lazily here when vllm config is available
+        rmsnorm_matcher = MatcherFusedAddRMSNorm(self.epsilon)
+        quant_matcher = MatcherQuant(kFp8StaticTensorSym)
 
         def pattern(
             mm_1: torch.Tensor,
@@ -319,9 +313,8 @@ class LastAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             scale: torch.Tensor,
         ) -> torch.Tensor:
             all_reduce = self._all_reduce(mm_1)
-            rmsnorm_output, _ = self.rmsnorm_matcher(all_reduce, weight,
-                                                     residual)
-            quant_output, _ = self.quant_matcher(rmsnorm_output, scale)
+            rmsnorm_output, _ = rmsnorm_matcher(all_reduce, weight, residual)
+            quant_output, _ = quant_matcher(rmsnorm_output, scale)
             return quant_output
 
         def replacement(
@@ -331,13 +324,21 @@ class LastAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             scale: torch.Tensor,
         ) -> torch.Tensor:
             reduce_scatter = self._reduce_scatter(mm_1)
-            rmsnorm_output, _ = self.rmsnorm_matcher(reduce_scatter, weight,
-                                                     residual)
-            quant_output, _ = self.quant_matcher(rmsnorm_output, scale)
+            rmsnorm_output, _ = rmsnorm_matcher(reduce_scatter, weight,
+                                                residual)
+            quant_output, _ = quant_matcher(rmsnorm_output, scale)
             all_gather = self._all_gather(quant_output)
             return all_gather
 
-        inputs = self.get_inputs()
+        inputs = [
+            torch.empty([4, 4], device=self.device, dtype=self.dtype),  # mm_1
+            torch.empty([4, 4], device=self.device,
+                        dtype=self.dtype),  # residual
+            torch.empty([4, 4], device=self.device,
+                        dtype=self.dtype),  # weight
+            torch.empty([1, 1], device=self.device,
+                        dtype=torch.float32),  # scale
+        ]
         pattern(*inputs)  # Trace the pattern
 
         pm.register_replacement(pattern, replacement, inputs, pm.fwd_only,
