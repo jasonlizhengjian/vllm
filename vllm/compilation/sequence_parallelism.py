@@ -257,20 +257,17 @@ class MiddleAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
 
     def get_inputs(self):
         mm_1 = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+        residual = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+        weight = torch.empty([4, 4], device=self.device, dtype=self.dtype)
         scale = torch.empty([1, 1], device=self.device, dtype=torch.float32)
-        return [
-            mm_1,
-            *self.rmsnorm_matcher.inputs(),  # input, weight, residual
-            scale,
-        ]
+        return [mm_1, residual, weight, scale]
 
     def register(self, pm_pass: PatternMatcherPass):
 
         def pattern(
             mm_1: torch.Tensor,
-            input: torch.Tensor,
-            weight: torch.Tensor,
             residual: torch.Tensor,
+            weight: torch.Tensor,
             scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             all_reduce = self._all_reduce(mm_1)
@@ -281,9 +278,8 @@ class MiddleAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
 
         def replacement(
             mm_1: torch.Tensor,
-            input: torch.Tensor,
-            weight: torch.Tensor,
             residual: torch.Tensor,
+            weight: torch.Tensor,
             scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             reduce_scatter = self._reduce_scatter(mm_1)
@@ -309,20 +305,17 @@ class LastAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
 
     def get_inputs(self):
         mm_1 = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+        residual = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+        weight = torch.empty([4, 4], device=self.device, dtype=self.dtype)
         scale = torch.empty([1, 1], device=self.device, dtype=torch.float32)
-        return [
-            mm_1,
-            *self.rmsnorm_matcher.inputs(),  # input, weight, residual
-            scale,
-        ]
+        return [mm_1, residual, weight, scale]
 
     def register(self, pm_pass: PatternMatcherPass):
 
         def pattern(
             mm_1: torch.Tensor,
-            input: torch.Tensor,
-            weight: torch.Tensor,
             residual: torch.Tensor,
+            weight: torch.Tensor,
             scale: torch.Tensor,
         ) -> torch.Tensor:
             all_reduce = self._all_reduce(mm_1)
@@ -333,9 +326,8 @@ class LastAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
 
         def replacement(
             mm_1: torch.Tensor,
-            input: torch.Tensor,
-            weight: torch.Tensor,
             residual: torch.Tensor,
+            weight: torch.Tensor,
             scale: torch.Tensor,
         ) -> torch.Tensor:
             reduce_scatter = self._reduce_scatter(mm_1)
