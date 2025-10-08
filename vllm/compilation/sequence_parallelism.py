@@ -241,8 +241,11 @@ class FirstAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             all_gather = self._all_gather(quant_output)
             return all_gather, reduce_scatter
 
-        pm.register_replacement(pattern, replacement, self.get_inputs(),
-                                pm.fwd_only, pm_pass)
+        inputs = self.get_inputs()
+        pattern(*inputs)  # Trace the pattern
+
+        pm.register_replacement(pattern, replacement, inputs, pm.fwd_only,
+                                pm_pass)
 
 
 class MiddleAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
@@ -290,8 +293,11 @@ class MiddleAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             all_gather = self._all_gather(quant_output)
             return all_gather, residual_output
 
-        pm.register_replacement(pattern, replacement, self.get_inputs(),
-                                pm.fwd_only, pm_pass)
+        inputs = self.get_inputs()
+        pattern(*inputs)  # Trace the pattern
+
+        pm.register_replacement(pattern, replacement, inputs, pm.fwd_only,
+                                pm_pass)
 
 
 class LastAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
@@ -339,8 +345,11 @@ class LastAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             all_gather = self._all_gather(quant_output)
             return all_gather
 
-        pm.register_replacement(pattern, replacement, self.get_inputs(),
-                                pm.fwd_only, pm_pass)
+        inputs = self.get_inputs()
+        pattern(*inputs)  # Trace the pattern
+
+        pm.register_replacement(pattern, replacement, inputs, pm.fwd_only,
+                                pm_pass)
 
 
 class SequenceParallelismPass(VllmPatternMatcherPass):
