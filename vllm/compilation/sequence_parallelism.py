@@ -208,11 +208,14 @@ class FirstAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
 
     def __init__(self, epsilon: float, dtype: torch.dtype, device: str):
         super().__init__(epsilon, dtype, device)
+        self.quant_op = torch.ops._C.static_scaled_fp8_quant.default
 
     def register(self, pm_pass: PatternMatcherPass):
-        # Create matchers lazily here when vllm config is available
-        rmsnorm_matcher = MatcherRMSNorm(self.epsilon)
-        quant_matcher = MatcherQuant(kFp8StaticTensorSym)
+        # Create matchers with enabled=True to match custom ops
+        # We explicitly pass enabled=True to avoid accessing vllm config
+        # which may not be set in spawned processes
+        rmsnorm_matcher = MatcherRMSNorm(self.epsilon, enabled=True)
+        quant_matcher = MatcherQuant(kFp8StaticTensorSym, enabled=True)
 
         def pattern(
             input: torch.Tensor,
@@ -230,9 +233,18 @@ class FirstAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             scale: torch.Tensor,
         ):
             reduce_scatter = self._reduce_scatter(input)
-            rmsnorm_output = rmsnorm_matcher(reduce_scatter, weight)
-            quant_output, _ = quant_matcher(rmsnorm_output, scale)
-            all_gather = self._all_gather(quant_output)
+            # Emit custom ops directly in replacement so fusion can match them
+            rmsnorm_result = torch.empty_like(reduce_scatter)
+            rmsnorm = self._functional_rmsnorm(rmsnorm_result, reduce_scatter,
+                                               weight)
+            quant_result = torch.empty_like(reduce_scatter,
+                                            dtype=current_platform.fp8_dtype())
+            quant = torch.ops.higher_order.auto_functionalized(
+                self.quant_op,
+                result=quant_result,
+                input=rmsnorm[1],
+                scale=scale)
+            all_gather = self._all_gather(quant[1])
             return all_gather, reduce_scatter
 
         inputs = [
@@ -250,11 +262,14 @@ class MiddleAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
 
     def __init__(self, epsilon: float, dtype: torch.dtype, device: str):
         super().__init__(epsilon, dtype, device)
+        self.quant_op = torch.ops._C.static_scaled_fp8_quant.default
 
     def register(self, pm_pass: PatternMatcherPass):
-        # Create matchers lazily here when vllm config is available
-        rmsnorm_matcher = MatcherFusedAddRMSNorm(self.epsilon)
-        quant_matcher = MatcherQuant(kFp8StaticTensorSym)
+        # Create matchers with enabled=True to match custom ops
+        # We explicitly pass enabled=True to avoid accessing vllm config
+        # which may not be set in spawned processes
+        rmsnorm_matcher = MatcherFusedAddRMSNorm(self.epsilon, enabled=True)
+        quant_matcher = MatcherQuant(kFp8StaticTensorSym, enabled=True)
 
         def pattern(
             mm_1: torch.Tensor,
@@ -275,11 +290,18 @@ class MiddleAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             reduce_scatter = self._reduce_scatter(mm_1)
-            rmsnorm_output, residual_output = rmsnorm_matcher(
-                reduce_scatter, weight, residual)
-            quant_output, _ = quant_matcher(rmsnorm_output, scale)
-            all_gather = self._all_gather(quant_output)
-            return all_gather, residual_output
+            # Emit custom ops directly in replacement so fusion can match them
+            rmsnorm = self._functional_fused_add_rmsnorm(
+                reduce_scatter, residual, weight)
+            quant_result = torch.empty_like(rmsnorm[1],
+                                            dtype=current_platform.fp8_dtype())
+            quant = torch.ops.higher_order.auto_functionalized(
+                self.quant_op,
+                result=quant_result,
+                input=rmsnorm[1],
+                scale=scale)
+            all_gather = self._all_gather(quant[1])
+            return all_gather, rmsnorm[2]
 
         inputs = [
             torch.empty([4, 4], device=self.device, dtype=self.dtype),  # mm_1
@@ -300,11 +322,14 @@ class LastAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
 
     def __init__(self, epsilon: float, dtype: torch.dtype, device: str):
         super().__init__(epsilon, dtype, device)
+        self.quant_op = torch.ops._C.static_scaled_fp8_quant.default
 
     def register(self, pm_pass: PatternMatcherPass):
-        # Create matchers lazily here when vllm config is available
-        rmsnorm_matcher = MatcherFusedAddRMSNorm(self.epsilon)
-        quant_matcher = MatcherQuant(kFp8StaticTensorSym)
+        # Create matchers with enabled=True to match custom ops
+        # We explicitly pass enabled=True to avoid accessing vllm config
+        # which may not be set in spawned processes
+        rmsnorm_matcher = MatcherFusedAddRMSNorm(self.epsilon, enabled=True)
+        quant_matcher = MatcherQuant(kFp8StaticTensorSym, enabled=True)
 
         def pattern(
             mm_1: torch.Tensor,
@@ -324,10 +349,17 @@ class LastAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             scale: torch.Tensor,
         ) -> torch.Tensor:
             reduce_scatter = self._reduce_scatter(mm_1)
-            rmsnorm_output, _ = rmsnorm_matcher(reduce_scatter, weight,
-                                                residual)
-            quant_output, _ = quant_matcher(rmsnorm_output, scale)
-            all_gather = self._all_gather(quant_output)
+            # Emit custom ops directly in replacement so fusion can match them
+            rmsnorm = self._functional_fused_add_rmsnorm(
+                reduce_scatter, residual, weight)
+            quant_result = torch.empty_like(rmsnorm[1],
+                                            dtype=current_platform.fp8_dtype())
+            quant = torch.ops.higher_order.auto_functionalized(
+                self.quant_op,
+                result=quant_result,
+                input=rmsnorm[1],
+                scale=scale)
+            all_gather = self._all_gather(quant[1])
             return all_gather
 
         inputs = [

@@ -35,7 +35,17 @@ if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
 class MatcherCustomOp(ABC):
 
     def __init__(self, enabled: bool):
-        self.model_dtype = get_current_vllm_config().model_config.dtype
+        # Try to get model_dtype from vllm config, but handle case where
+        # it's not set (e.g., in spawned processes during testing)
+        try:
+            vllm_config = get_current_vllm_config()
+            if vllm_config and vllm_config.model_config:
+                self.model_dtype = vllm_config.model_config.dtype
+            else:
+                self.model_dtype = torch.float16
+        except (AttributeError, RuntimeError):
+            # Default to float16 if vllm config is not available
+            self.model_dtype = torch.float16
 
         self.enabled = enabled
         self.forward = self.forward_custom if enabled else self.forward_native
@@ -178,12 +188,19 @@ class MatcherQuant:
         self.QUANT_OP = QUANT_OPS[quant_key]
 
         assert quant_key.scale2 is None
-        self.quant_fp8 = QuantFP8(quant_key.scale.static,
-                                  quant_key.scale.group_shape)
+
+        # Only create QuantFP8 instance if needed (when enabled is None
+        # or False). This avoids accessing vllm config in spawned processes
+        # when enabled=True
+        self.quant_fp8: Optional[QuantFP8] = None
+        if enabled is None or enabled is False:
+            self.quant_fp8 = QuantFP8(quant_key.scale.static,
+                                      quant_key.scale.group_shape)
 
         if enabled is None:
             # TODO either pass config to enabled or set it globally
             #  (global during pass init seems reasonable)
+            assert self.quant_fp8 is not None
             enabled = self.quant_fp8.enabled()
 
         self.forward = self.forward_custom if enabled else self.forward_native
@@ -221,6 +238,8 @@ class MatcherQuant:
         input: torch.Tensor,
         scale: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.quant_fp8 is not None, \
+            "quant_fp8 should be initialized when forward_native is used"
         return self.quant_fp8(input, scale)
 
     def make_scale(self, input: torch.Tensor):

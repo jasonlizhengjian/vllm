@@ -12,8 +12,8 @@ from vllm.compilation.noop_elimination import NoOpEliminationPass
 from vllm.compilation.post_cleanup import PostCleanupPass
 from vllm.compilation.sequence_parallelism import SequenceParallelismPass
 from vllm.compilation.vllm_inductor_pass import VllmInductorPass
-from vllm.config import (CompilationConfig, DeviceConfig, ModelConfig,
-                         PassConfig, VllmConfig)
+from vllm.config import (CompilationConfig, CompilationLevel, DeviceConfig,
+                         ModelConfig, PassConfig, VllmConfig)
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import (init_distributed_environment,
                                              initialize_model_parallel)
@@ -240,10 +240,15 @@ def sequence_parallelism_pass_on_test_model(
 
     # configure vllm config for SequenceParallelismPass
     vllm_config = VllmConfig()
-    vllm_config.compilation_config = CompilationConfig(pass_config=PassConfig(
-        enable_sequence_parallelism=True,
-        enable_fusion=enable_fusion,
-        enable_noop=True))  # NoOp needed for fusion
+    # Enable custom ops so that matchers will match custom ops instead
+    # of decomposed ops
+    custom_ops = ["+rms_norm", "+quant_fp8"]
+    vllm_config.compilation_config = CompilationConfig(
+        level=CompilationLevel.PIECEWISE,
+        custom_ops=custom_ops,
+        pass_config=PassConfig(enable_sequence_parallelism=True,
+                               enable_fusion=enable_fusion,
+                               enable_noop=True))  # NoOp needed for fusion
     vllm_config.device_config = DeviceConfig(device=torch.device("cuda"))
 
     # this is a fake model name to construct the model config
@@ -254,19 +259,23 @@ def sequence_parallelism_pass_on_test_model(
                                            dtype=dtype,
                                            seed=42)
 
-    noop_pass = NoOpEliminationPass(vllm_config)
-    sequence_parallelism_pass = SequenceParallelismPass(vllm_config)
-    func_pass = FixFunctionalizationPass(vllm_config)
-    cleanup_pass = PostCleanupPass(vllm_config)
+    # Set vllm config as current during pass initialization so that matchers
+    # can check if custom ops are enabled
+    import vllm.config
+    with vllm.config.set_current_vllm_config(vllm_config):
+        noop_pass = NoOpEliminationPass(vllm_config)
+        sequence_parallelism_pass = SequenceParallelismPass(vllm_config)
+        func_pass = FixFunctionalizationPass(vllm_config)
+        cleanup_pass = PostCleanupPass(vllm_config)
 
-    passes_for_backend: list[VllmInductorPass] = \
-        [noop_pass, sequence_parallelism_pass]
+        passes_for_backend: list[VllmInductorPass] = \
+            [noop_pass, sequence_parallelism_pass]
 
-    if enable_fusion:
-        fusion_pass = RMSNormQuantFusionPass(vllm_config)
-        passes_for_backend.append(fusion_pass)
+        if enable_fusion:
+            fusion_pass = RMSNormQuantFusionPass(vllm_config)
+            passes_for_backend.append(fusion_pass)
 
-    passes_for_backend.append(cleanup_pass)
+        passes_for_backend.append(cleanup_pass)
 
     backend_no_func = TestBackend(*passes_for_backend)
     backend_func = TestBackend(*passes_for_backend, func_pass)
