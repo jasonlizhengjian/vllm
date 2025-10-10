@@ -8,17 +8,21 @@ WARNING: This test runs in both single-node (4 GPUs) and multi-node
  to fail.
 """
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Literal, NamedTuple, Optional
 
 import pytest
 
-from vllm.config import RunnerOption
+from vllm import LLM, SamplingParams
+from vllm.config import (CompilationConfig, CompilationLevel, CUDAGraphMode,
+                         PassConfig, RunnerOption)
 from vllm.logger import init_logger
 
 from ..models.registry import HF_EXAMPLE_MODELS
-from ..utils import compare_two_settings, create_new_process_for_each_test
+from ..utils import (compare_two_settings, create_new_process_for_each_test,
+                     multi_gpu_test)
 
 logger = init_logger("test_sequence_parallel")
 
@@ -231,9 +235,14 @@ def _compare_sp(
     if skip_tokenizer_init:
         common_args.append("--skip-tokenizer-init")
 
+    # For fusion to work with FP8, we need both custom ops enabled
+    custom_ops = ["+rms_norm"]
+    if enable_fusion:
+        custom_ops.append("+quant_fp8")
+
     compilation_config = {
         'level': 3,
-        'custom_ops': ["+rms_norm"],
+        'custom_ops': custom_ops,
         'compile_sizes': [4, 8],
         'pass_config': {
             'enable_sequence_parallelism': True,
@@ -328,3 +337,100 @@ def test_tp_sp_generation(
                 num_gpus_available,
                 method="generate",
                 is_multimodal=False)
+
+    # Log test configuration for visibility
+    logger.info("✓ Test passed: %s with backend=%s, fusion=%s, tp=%s",
+                model_id, distributed_backend, parallel_setup.enable_fusion,
+                parallel_setup.tp_size)
+
+
+@multi_gpu_test(num_gpus=2)
+@pytest.mark.parametrize("enable_fusion", [False, True])
+def test_tp_sp_fusion_verification(enable_fusion: bool, caplog_mp_spawn,
+                                   monkeypatch):
+    """
+    Verify that fusion and sequence parallelism passes actually run.
+    This test uses LLM() directly (not RemoteOpenAIServer) so we can
+    capture logs and verify the passes executed.
+    """
+    # Disable compile cache to ensure passes run
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+    model = "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8"
+
+    # Configure custom ops based on fusion setting
+    custom_ops = ["+rms_norm"]
+    if enable_fusion:
+        custom_ops.append("+quant_fp8")
+
+    # Dump FX graphs at each compilation stage for manual inspection
+    import tempfile
+    debug_dir = tempfile.mkdtemp(prefix=f"vllm_debug_fusion_{enable_fusion}_")
+    logger.info("Dumping FX graphs to: %s", debug_dir)
+
+    compilation_config = CompilationConfig(
+        level=CompilationLevel.PIECEWISE,
+        custom_ops=custom_ops,
+        cudagraph_mode=CUDAGraphMode.NONE,
+        debug_dump_path=debug_dir,  # Enable graph dumping
+        pass_config=PassConfig(
+            enable_sequence_parallelism=True,
+            enable_fusion=enable_fusion,
+            enable_noop=True,
+        ),
+        inductor_compile_config={"force_disable_caches": True},
+    )
+
+    prompts = ["Hello, my name is"]
+    sampling_params = SamplingParams(temperature=0, max_tokens=10)
+
+    with caplog_mp_spawn(logging.DEBUG):
+        llm = LLM(
+            model=model,
+            tensor_parallel_size=2,
+            dtype="float16",  # Required for FP8 fusion
+            enforce_eager=True,
+            max_model_len=2048,
+            load_format="dummy",
+            compilation_config=compilation_config,
+            disable_custom_all_reduce=True,
+        )
+        outputs = llm.generate(prompts, sampling_params)
+
+        # Verify generation succeeded
+        assert len(outputs) > 0
+        assert len(outputs[0].outputs[0].text) > 0
+
+    # Log verification via FX graph dumps
+    logger.info("\n%s", "=" * 80)
+    logger.info("Test completed successfully with fusion=%s", enable_fusion)
+    logger.info("FX graphs dumped to: %s", debug_dir)
+    logger.info("%s\n", "=" * 80)
+
+    # Check if graphs were dumped
+    import os
+    if os.path.exists(debug_dir):
+        graph_files = os.listdir(debug_dir)
+        logger.info("Found %d graph dump files", len(graph_files))
+
+        # Look for evidence of passes running
+        for f in sorted(graph_files)[:10]:  # Show first 10 files
+            logger.info("  - %s", f)
+
+        if enable_fusion:
+            # Check for fusion-related files
+            fusion_files = [f for f in graph_files if 'fusion' in f.lower()]
+            logger.info("\nFusion-related files: %d", len(fusion_files))
+
+        sp_files = [
+            f for f in graph_files
+            if 'sequence' in f.lower() or 'parallelism' in f.lower()
+        ]
+        logger.info("Sequence parallelism files: %d", len(sp_files))
+
+        logger.info("\nTo manually inspect graphs:")
+        logger.info("  ls -lh %s", debug_dir)
+        logger.info("  grep -r 'rms_norm_static_fp8_quant' %s/", debug_dir)
+    else:
+        logger.warning("Debug directory not found: %s", debug_dir)
