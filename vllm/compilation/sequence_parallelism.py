@@ -496,15 +496,52 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
         # 2. For specific shape provided during compilation (e.g., from
         #    `compile_sizes`), which must be divisible by the tensor-parallel
         #    size.
+
+        tp_size = get_tensor_model_parallel_world_size()
+
+        logger.info(
+            "SequenceParallelismPass.is_applicable: "
+            "shape=%s, tp_size=%d, dtype=%s, "
+            "splitting_ops=%s, use_inductor_graph_partition=%s",
+            shape, tp_size, self.model_dtype,
+            self.compilation_config.splitting_ops,
+            self.compilation_config.use_inductor_graph_partition
+        )
+
+        if shape is not None and shape < 4096:
+            logger.info(
+                "SequenceParallelismPass: NOT APPLICABLE - "
+                "shape is less than 4k (shape=%s)",
+                shape
+            )
+            return False
+
         if (
             not self.compilation_config.splitting_ops
             or self.compilation_config.use_inductor_graph_partition
         ):
+            logger.info(
+                "SequenceParallelismPass: APPLICABLE - "
+                "full-graph mode or using graph partition"
+            )
             return True
-        tp_size = get_tensor_model_parallel_world_size()
-        return shape is not None and shape % tp_size == 0
+
+        is_applicable = shape is not None and shape % tp_size == 0
+        logger.info(
+            "SequenceParallelismPass: %s - "
+            "piecewise mode requires shape divisible by tp_size "
+            "(shape=%s, shape %% tp_size == 0: %s)",
+            "APPLICABLE" if is_applicable else "NOT APPLICABLE",
+            shape,
+            shape is not None and shape % tp_size == 0
+        )
+        return is_applicable
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph):
         self.matched_count = self.patterns.apply(graph)
+        logger.info(
+            "SequenceParallelismPass: Replaced %d patterns in graph",
+            self.matched_count
+        )
         logger.debug("Replaced %s patterns", self.matched_count)
