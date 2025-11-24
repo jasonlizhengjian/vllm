@@ -6,6 +6,7 @@ pynvml. However, it should not initialize cuda context.
 
 import os
 from collections.abc import Callable
+from ctypes import CDLL, POINTER, Structure, c_int, c_uint, c_ulong, get_errno
 from functools import cache, wraps
 from typing import TYPE_CHECKING, TypeVar
 
@@ -40,6 +41,152 @@ pynvml = import_pynvml()
 # pytorch 2.5 uses cudnn sdpa by default, which will cause crash on some models
 # see https://github.com/huggingface/diffusers/issues/9704 for details
 torch.backends.cuda.enable_cudnn_sdp(False)
+
+
+def _migrate_pages_via_libnuma(
+    pid: int, source_nodes: list[int], target_node: int
+) -> bool:
+    """
+    Migrate memory pages from source NUMA nodes to target NUMA node using libnuma.
+    
+    This uses ctypes to directly call numa_migrate_pages() from libnuma,
+    which is more efficient than subprocess calls to migratepages.
+    
+    The approach is based on the CPU backend implementation in csrc/cpu/utils.cpp:
+    - Get current memory binding (membind) to identify source nodes
+    - Create a bitmask with source nodes XOR target node
+    - Call numa_migrate_pages(pid, from_mask, to_mask)
+    
+    Args:
+        pid: Process ID whose memory pages should be migrated
+        source_nodes: List of source NUMA node IDs
+        target_node: Target NUMA node ID
+        
+    Returns:
+        True if migration was successful, False if libnuma is not available
+        or migration failed.
+    """
+    try:
+        # Try to load libnuma
+        libnuma = CDLL("libnuma.so.1", use_errno=True)
+        
+        # Check if NUMA is available
+        numa_available = libnuma.numa_available
+        numa_available.restype = c_int
+        if numa_available() == -1:
+            logger.debug("NUMA is not available on this system")
+            return False
+        
+        # Get the maximum number of nodes to determine bitmask size
+        numa_max_node = libnuma.numa_max_node
+        numa_max_node.restype = c_int
+        max_node = numa_max_node()
+        
+        if max_node < 0:
+            logger.debug("Failed to get max NUMA node")
+            return False
+        
+        # Define struct bitmask structure matching libnuma
+        # struct bitmask {
+        #     unsigned long size;  /* number of bits in the map */
+        #     unsigned long *maskp;
+        # }
+        from ctypes import POINTER, Structure, c_void_p
+        
+        class Bitmask(Structure):
+            _fields_ = [("size", c_ulong), ("maskp", POINTER(c_ulong))]
+        
+        # Get function signatures
+        numa_allocate_nodemask = libnuma.numa_allocate_nodemask
+        numa_allocate_nodemask.restype = POINTER(Bitmask)
+        
+        numa_bitmask_setbit = libnuma.numa_bitmask_setbit
+        numa_bitmask_setbit.argtypes = [POINTER(Bitmask), c_uint]
+        numa_bitmask_setbit.restype = POINTER(Bitmask)
+        
+        numa_bitmask_clearbit = libnuma.numa_bitmask_clearbit
+        numa_bitmask_clearbit.argtypes = [POINTER(Bitmask), c_uint]
+        numa_bitmask_clearbit.restype = POINTER(Bitmask)
+        
+        numa_migrate_pages = libnuma.numa_migrate_pages
+        numa_migrate_pages.argtypes = [c_int, POINTER(Bitmask), POINTER(Bitmask)]
+        numa_migrate_pages.restype = c_int
+        
+        # Try to get the free function - different names on different versions
+        # numa_bitmask_free is the modern API, numa_free_nodemask is older
+        try:
+            numa_free_fn = libnuma.numa_bitmask_free
+        except AttributeError:
+            try:
+                numa_free_fn = libnuma.numa_free_nodemask
+            except AttributeError:
+                logger.debug("Neither numa_bitmask_free nor numa_free_nodemask found")
+                return False
+        
+        numa_free_fn.argtypes = [POINTER(Bitmask)]
+        numa_free_fn.restype = None
+        
+        # Create bitmasks for source and target
+        from_mask = numa_allocate_nodemask()
+        to_mask = numa_allocate_nodemask()
+        
+        if not from_mask or not to_mask:
+            logger.debug("Failed to allocate NUMA node masks")
+            return False
+        
+        try:
+            # Set bits for source nodes
+            for source_node in source_nodes:
+                numa_bitmask_setbit(from_mask, source_node)
+            
+            # Set bit for target node
+            numa_bitmask_setbit(to_mask, target_node)
+            
+            # Call numa_migrate_pages
+            # Return value: number of pages that could NOT be moved (0 = all pages moved)
+            # -1 on error
+            result = numa_migrate_pages(pid, from_mask, to_mask)
+            
+            if result == -1:
+                errno = get_errno()
+                logger.warning(
+                    "numa_migrate_pages failed for pid %d: errno=%d", pid, errno
+                )
+                return False
+            
+            # result is the number of pages that could NOT be moved
+            # 0 means all pages were successfully migrated
+            if result == 0:
+                logger.info(
+                    "Successfully migrated all pages from nodes %s to node %d for pid %d using libnuma system call",
+                    source_nodes,
+                    target_node,
+                    pid,
+                )
+            else:
+                logger.warning(
+                    "Migrated pages from nodes %s to node %d for pid %d using libnuma system call, "
+                    "but %d pages could not be moved",
+                    source_nodes,
+                    target_node,
+                    pid,
+                    result,
+                )
+            return True
+            
+        finally:
+            # Clean up allocated masks
+            numa_free_fn(from_mask)
+            numa_free_fn(to_mask)
+        
+    except (OSError, AttributeError) as e:
+        # libnuma not available or function not found
+        logger.debug("libnuma not available for direct memory migration: %s", str(e))
+        return False
+    except Exception as e:
+        # Catch any other errors during migration
+        logger.warning("Error during libnuma memory migration: %s", str(e))
+        return False
 
 
 @cache
@@ -609,7 +756,19 @@ class NvmlCudaPlatform(CudaPlatformBase):
     def set_cpu_affinity(cls, device_id: int) -> None:
         """
         Set CPU affinity for the current process based on GPU device ID.
+        
+        This binds the process to CPUs in the same NUMA node as the GPU.
+        Can be disabled by setting VLLM_DISABLE_CPU_AFFINITY=1.
+        
+        Args:
+            device_id: Logical CUDA device index (0-based relative to visible devices).
+                      This will be mapped to the physical device ID internally.
         """
+        # Allow disabling CPU affinity via environment variable
+        if os.environ.get("VLLM_DISABLE_CPU_AFFINITY", "0") == "1":
+            logger.info("CPU affinity setting is disabled via VLLM_DISABLE_CPU_AFFINITY")
+            return
+            
         try:
             import psutil
         except ImportError:
@@ -620,11 +779,21 @@ class NvmlCudaPlatform(CudaPlatformBase):
             return
 
         try:
-            physical_device_id = cls.device_id_to_physical_device_id(device_id)
-            handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
-
-            # Get CPU affinity for this GPU
-            # We need to determine the CPU set size first
+            # Get current affinity before setting
+            current_process = psutil.Process()
+            original_affinity = current_process.cpu_affinity()
+            
+            # Read original affinity from /proc filesystem for verification
+            original_affinity_from_proc = None
+            try:
+                with open(f"/proc/{current_process.pid}/status", "r") as f:
+                    for line in f:
+                        if line.startswith("Cpus_allowed_list:"):
+                            original_affinity_from_proc = line.split(":", 1)[1].strip()
+                            break
+            except Exception:
+                pass  # If we can't read it, just continue
+            
             cpu_count = os.cpu_count()
             if cpu_count is None:
                 logger.warning(
@@ -634,7 +803,35 @@ class NvmlCudaPlatform(CudaPlatformBase):
 
             cpu_set_size = (cpu_count + 63) // 64
 
-            # Get CPU affinity from NVML
+            # device_id is a logical CUDA device index (0-based relative to CUDA_VISIBLE_DEVICES)
+            # We need to map it to the physical device ID for NVML
+            # NVML uses physical device IDs (PCI bus order), not affected by CUDA_VISIBLE_DEVICES
+            physical_device_id = cls.device_id_to_physical_device_id(device_id)
+            
+            # Get CUDA device UUID to verify we're querying the right device
+            cuda_uuid = torch.cuda.get_device_properties(device_id).uuid
+            
+            # Get NVML handle and verify it matches
+            handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
+            nvml_uuid = pynvml.nvmlDeviceGetUUID(handle)
+            
+            # Normalize UUIDs for comparison (NVML includes "GPU-" prefix, PyTorch doesn't)
+            cuda_uuid_normalized = str(cuda_uuid).replace("GPU-", "")
+            nvml_uuid_normalized = str(nvml_uuid).replace("GPU-", "")
+            
+            # Verify the mapping is correct
+            if cuda_uuid_normalized != nvml_uuid_normalized:
+                logger.warning(
+                    "Device ID mapping mismatch: logical GPU %d has UUID %s, "
+                    "but physical GPU %d has UUID %s. Skipping CPU affinity setting.",
+                    device_id,
+                    cuda_uuid,
+                    physical_device_id,
+                    nvml_uuid,
+                )
+                return
+
+            # Get CPU affinity from NVML for this physical GPU
             cpu_affinity_mask = pynvml.nvmlDeviceGetCpuAffinity(handle, cpu_set_size)
 
             # Convert the bitmask to a list of CPU IDs
@@ -649,23 +846,296 @@ class NvmlCudaPlatform(CudaPlatformBase):
 
             if cpu_ids:
                 # Set CPU affinity using psutil
-                current_process = psutil.Process()
                 current_process.cpu_affinity(cpu_ids)
-                logger.info(
-                    "Set CPU affinity for process %d to CPUs %s for GPU devices %s",
-                    current_process.pid,
-                    cpu_ids,
-                    device_id,
-                )
+                
+                # Verify the affinity was actually set by reading from /proc filesystem
+                try:
+                    with open(f"/proc/{current_process.pid}/status", "r") as f:
+                        for line in f:
+                            if line.startswith("Cpus_allowed_list:"):
+                                actual_affinity = line.split(":", 1)[1].strip()
+                                logger.info(
+                                    "Set CPU affinity for process %d to CPUs %s for logical GPU %d (physical GPU %d). "
+                                    "Restricted from %d cores to %d cores. "
+                                    "/proc verification: before=%s, after=%s. "
+                                    "Set VLLM_DISABLE_CPU_AFFINITY=1 to disable.",
+                                    current_process.pid,
+                                    cpu_ids,
+                                    device_id,
+                                    physical_device_id,
+                                    len(original_affinity),
+                                    len(cpu_ids),
+                                    original_affinity_from_proc or "unknown",
+                                    actual_affinity,
+                                )
+                                break
+                except Exception as e:
+                    # Fallback if we can't read /proc
+                    logger.info(
+                        "Set CPU affinity for process %d to CPUs %s for logical GPU %d (physical GPU %d). "
+                        "Restricted from %d cores to %d cores. "
+                        "/proc before=%s. Set VLLM_DISABLE_CPU_AFFINITY=1 to disable.",
+                        current_process.pid,
+                        cpu_ids,
+                        device_id,
+                        physical_device_id,
+                        len(original_affinity),
+                        len(cpu_ids),
+                        original_affinity_from_proc or "unknown",
+                    )
+                
+                # Migrate existing memory to the target NUMA node
+                # Only migrate if we successfully set CPU affinity
+                if os.environ.get("VLLM_MIGRATE_NUMA_MEMORY", "1") == "1":
+                    import time
+                    
+                    try:
+                        # Determine target NUMA node using NVML's memory affinity API
+                        # This is the correct way to get the NUMA node for a GPU
+                        memory_affinity_mask = pynvml.nvmlDeviceGetMemoryAffinity(
+                            handle, cpu_set_size, pynvml.NVML_AFFINITY_SCOPE_NODE
+                        )
+                        
+                        # Find the NUMA node from the memory affinity bitmask
+                        target_numa_node = -1
+                        for i, mask in enumerate(memory_affinity_mask):
+                            if mask != 0:
+                                # Find the first set bit in this group
+                                for bit in range(64):
+                                    if mask & (1 << bit):
+                                        target_numa_node = i * 64 + bit
+                                        break
+                                if target_numa_node != -1:
+                                    break
+                        
+                        if target_numa_node == -1:
+                            logger.warning(
+                                "Could not determine target NUMA node from nvmlDeviceGetMemoryAffinity for GPU %d",
+                                physical_device_id,
+                            )
+                            # Fallback to heuristic
+                            target_numa_node = min(cpu_ids) // (cpu_count // 2)
+                            logger.info(
+                                "Using fallback heuristic: target NUMA node %d for GPU %d",
+                                target_numa_node,
+                                physical_device_id,
+                            )
+                        else:
+                            logger.debug(
+                                "Determined target NUMA node %d from nvmlDeviceGetMemoryAffinity for GPU %d",
+                                target_numa_node,
+                                physical_device_id,
+                            )
+                        
+                        # Determine source nodes (all nodes except target)
+                        num_numa_nodes = (cpu_count + (cpu_count // 2) - 1) // (cpu_count // 2)
+                        source_nodes = [n for n in range(num_numa_nodes) if n != target_numa_node]
+                        
+                        if source_nodes:
+                            logger.info(
+                                "Migrating memory for process %d from NUMA nodes %s to node %d",
+                                current_process.pid,
+                                source_nodes,
+                                target_numa_node,
+                            )
+                            start_time = time.time()
+                            
+                            # Try libnuma-based migration first
+                            success = _migrate_pages_via_libnuma(
+                                current_process.pid, source_nodes, target_numa_node
+                            )
+                            
+                            if not success:
+                                # Fall back to subprocess-based migration
+                                import subprocess
+                                
+                                logger.info(
+                                    "Using subprocess-based memory migration for process %d (libnuma not available or failed)",
+                                    current_process.pid,
+                                )
+                                
+                                # Run migratepages for each source node
+                                for source_node in source_nodes:
+                                    try:
+                                        result = subprocess.run(
+                                            ["migratepages", str(current_process.pid), 
+                                             str(source_node), str(target_numa_node)],
+                                            capture_output=True,
+                                            text=True,
+                                            timeout=30,
+                                        )
+                                        if result.returncode != 0 and result.returncode != 1:
+                                            # returncode 1 can mean "no pages to migrate", which is fine
+                                            logger.warning(
+                                                "migratepages from node %d to %d returned code %d: %s",
+                                                source_node,
+                                                target_numa_node,
+                                                result.returncode,
+                                                result.stderr.strip() if result.stderr else "",
+                                            )
+                                    except FileNotFoundError:
+                                        logger.warning(
+                                            "migratepages command not found. Install numactl package to enable memory migration."
+                                        )
+                                        break
+                                    except subprocess.TimeoutExpired:
+                                        logger.warning(
+                                            "Memory migration timed out after 30 seconds for process %d from node %d",
+                                            current_process.pid,
+                                            source_node,
+                                        )
+                            
+                            elapsed = time.time() - start_time
+                            logger.info(
+                                "Memory migration completed for process %d in %.2f seconds",
+                                current_process.pid,
+                                elapsed,
+                            )
+                            
+                            # Set memory binding for future allocations to the target NUMA node
+                            # This matches the behavior of the CPU backend (csrc/cpu/utils.cpp)
+                            # which uses numa_set_membind() and numa_set_strict()
+                            try:
+                                # Try to use libnuma for memory binding (preferred method)
+                                libnuma = CDLL("libnuma.so.1", use_errno=True)
+                                
+                                # Define Bitmask structure
+                                class Bitmask(Structure):
+                                    _fields_ = [("size", c_ulong), ("maskp", POINTER(c_ulong))]
+                                
+                                # Get function signatures
+                                numa_allocate_nodemask = libnuma.numa_allocate_nodemask
+                                numa_allocate_nodemask.restype = POINTER(Bitmask)
+                                
+                                numa_bitmask_setbit = libnuma.numa_bitmask_setbit
+                                numa_bitmask_setbit.argtypes = [POINTER(Bitmask), c_uint]
+                                numa_bitmask_setbit.restype = POINTER(Bitmask)
+                                
+                                numa_set_membind = libnuma.numa_set_membind
+                                numa_set_membind.argtypes = [POINTER(Bitmask)]
+                                numa_set_membind.restype = None
+                                
+                                numa_set_strict = libnuma.numa_set_strict
+                                numa_set_strict.argtypes = [c_int]
+                                numa_set_strict.restype = None
+                                
+                                # Get the free function (handle different API versions)
+                                try:
+                                    numa_free_fn = libnuma.numa_bitmask_free
+                                except AttributeError:
+                                    numa_free_fn = libnuma.numa_free_nodemask
+                                
+                                numa_free_fn.argtypes = [POINTER(Bitmask)]
+                                numa_free_fn.restype = None
+                                
+                                # Create bitmask for the target node
+                                membind_mask = numa_allocate_nodemask()
+                                if not membind_mask:
+                                    logger.warning(
+                                        "Failed to allocate nodemask for membind setting"
+                                    )
+                                else:
+                                    try:
+                                        # Set bit for target node
+                                        numa_bitmask_setbit(membind_mask, target_numa_node)
+                                        
+                                        # Set memory binding to restrict allocations to target node
+                                        numa_set_membind(membind_mask)
+                                        
+                                        # Set strict mode (fail if target node is full)
+                                        numa_set_strict(1)
+                                        
+                                        logger.info(
+                                            "Set memory binding to NUMA node %d for process %d (strict mode)",
+                                            target_numa_node,
+                                            current_process.pid,
+                                        )
+                                    finally:
+                                        numa_free_fn(membind_mask)
+                                        
+                            except Exception as e:
+                                logger.debug(
+                                    "Failed to set memory binding via libnuma for process %d: %s. "
+                                    "Attempting set_mempolicy syscall fallback.",
+                                    current_process.pid,
+                                    str(e),
+                                )
+                                
+                                # Fallback to set_mempolicy syscall if libnuma fails
+                                try:
+                                    from ctypes import c_long
+                                    import platform
+                                    
+                                    # MPOL_BIND = 2 (strict binding to specific nodes)
+                                    MPOL_BIND = 2
+                                    
+                                    # syscall numbers differ by architecture
+                                    machine = platform.machine()
+                                    if machine == 'aarch64':
+                                        SYS_set_mempolicy = 237
+                                    elif machine == 'x86_64':
+                                        SYS_set_mempolicy = 238
+                                    else:
+                                        logger.debug(
+                                            "Unknown architecture %s for set_mempolicy, skipping",
+                                            machine,
+                                        )
+                                        raise Exception(f"Unsupported architecture: {machine}")
+                                    
+                                    # Load libc to access syscall
+                                    libc = CDLL("libc.so.6", use_errno=True)
+                                    syscall = libc.syscall
+                                    syscall.restype = c_long
+                                    
+                                    # Create nodemask for the target node
+                                    max_nodes = 64
+                                    nodemask = (c_ulong * ((max_nodes + 63) // 64))()
+                                    nodemask[target_numa_node // 64] = 1 << (target_numa_node % 64)
+                                    
+                                    # Call set_mempolicy with MPOL_BIND for strict binding
+                                    result = syscall(
+                                        SYS_set_mempolicy,
+                                        MPOL_BIND,
+                                        nodemask,
+                                        max_nodes,
+                                    )
+                                    
+                                    if result == 0:
+                                        logger.info(
+                                            "Set memory policy (MPOL_BIND) to NUMA node %d for process %d via syscall",
+                                            target_numa_node,
+                                            current_process.pid,
+                                        )
+                                    else:
+                                        errno = get_errno()
+                                        logger.warning(
+                                            "set_mempolicy syscall failed for process %d: errno=%d",
+                                            current_process.pid,
+                                            errno,
+                                        )
+                                        
+                                except Exception as e2:
+                                    logger.debug(
+                                        "Failed to set memory policy for process %d: %s",
+                                        current_process.pid,
+                                        str(e2),
+                                    )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to migrate memory for process %d: %s",
+                            current_process.pid,
+                            str(e),
+                        )
             else:
                 logger.warning(
-                    "No CPU affinity information available for GPU devices %s",
+                    "No CPU affinity information available for logical GPU %d (physical GPU %d)",
                     device_id,
+                    physical_device_id,
                 )
 
         except Exception as e:
             logger.warning(
-                "Failed to set CPU affinity for GPU devices %s: %s", device_id, str(e)
+                "Failed to set CPU affinity for logical GPU %d: %s", device_id, str(e)
             )
 
 
@@ -697,7 +1167,7 @@ class NonNvmlCudaPlatform(CudaPlatformBase):
     def set_cpu_affinity(cls, device_id: int) -> None:
         """
         Set CPU affinity for the current process based on GPU device ID.
-        This is a no-op for NonNvmlCudaPlatform.
+        This is a no-op for NonNvmlCudaPlatform as NVML is not available.
         """
         pass
 

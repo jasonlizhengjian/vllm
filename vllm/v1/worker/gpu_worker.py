@@ -159,8 +159,6 @@ class Worker(WorkerBase):
 
     def init_device(self):
         if self.device_config.device.type == "cuda":
-            current_platform.set_cpu_affinity(self.local_rank)
-
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             if (
@@ -196,7 +194,10 @@ class Worker(WorkerBase):
                 )
             self.device = torch.device(f"cuda:{self.local_rank}")
             current_platform.set_device(self.device)
-
+            
+            # CPU affinity is set early in worker_main() before any initialization
+            # to ensure memory is allocated on the correct NUMA node from the start
+            
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
             # Initialize the distributed environment BEFORE taking

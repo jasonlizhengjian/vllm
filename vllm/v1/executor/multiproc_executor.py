@@ -677,6 +677,16 @@ class WorkerProc:
         """Worker initialization and execution loops.
         This runs a background process"""
 
+        # Set CPU affinity FIRST, before any memory allocation or imports
+        # This ensures memory will be allocated on the correct NUMA node
+        local_rank = kwargs.get("local_rank")
+        if local_rank is not None:
+            from vllm.platforms import current_platform
+            try:
+                current_platform.set_cpu_affinity(local_rank)
+            except Exception as e:
+                logger.warning("Failed to set CPU affinity early: %s", e)
+
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker
         # processes to terminate without error
