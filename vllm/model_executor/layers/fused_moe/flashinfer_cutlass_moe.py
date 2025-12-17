@@ -224,6 +224,8 @@ class FlashInferExperts(mk.FusedMoEPermuteExpertsUnpermute):
             activation_type=activation_str_to_value_map[activation],
             # Informs FlashInfer to use the block-scale decoding path when True
             use_deepseek_fp8_block_scale=self.use_deepseek_fp8_block_scale,
+            # Tune autotuner based on actual batch size for optimal kernel selection
+            tune_max_num_tokens=2 ** (hidden_states.shape[0] - 1).bit_length(),
         )
 
 
