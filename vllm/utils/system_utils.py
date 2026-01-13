@@ -157,7 +157,20 @@ def get_mp_context():
     VLLM_WORKER_MULTIPROC_METHOD.
     """
     _maybe_force_spawn()
-    mp_method = envs.VLLM_WORKER_MULTIPROC_METHOD
+    # Read from os.environ directly since envs caches at import time
+    mp_method = os.environ.get(
+        "VLLM_WORKER_MULTIPROC_METHOD", envs.VLLM_WORKER_MULTIPROC_METHOD
+    )
+
+    # Also set the global start method so that multiprocessing.get_start_method()
+    # returns the correct value. This is needed for NUMA binding which checks
+    # the global method.
+    try:
+        multiprocessing.set_start_method(mp_method, force=True)
+    except RuntimeError:
+        # Already set, which is fine
+        pass
+
     return multiprocessing.get_context(mp_method)
 
 
