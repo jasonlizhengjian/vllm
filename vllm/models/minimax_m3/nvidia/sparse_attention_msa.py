@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MSA (SM100/Blackwell) block-sparse attend for MiniMax M3.
+"""MSA (SM100/Blackwell) block-sparse attention for MiniMax M3.
 
-Prefill attends with ``fmha_sm100`` (``build_k2q_csr`` + ``sparse_atten_func``);
-decode falls back to the Triton split-K kernel (no MSA decode yet). ``fmha_sm100``
-imports are function-local, so this module is import-safe on AMD/non-SM100.
+Prefill attends with ``fmha_sm100`` (``build_k2q_csr`` + ``sparse_atten_func``).
+Decode uses Triton split-K by default, with an opt-in CUTLASS ``fmha_sm100``
+path for multi-token speculative verification.
 """
 
 import torch
@@ -18,11 +18,37 @@ from vllm.models.minimax_m3.common.sparse_attention import (
     MiniMaxM3SparseImpl,
     MiniMaxM3SparseMetadata,
 )
+from vllm.models.minimax_m3.nvidia.msa_cutlass_sparse_decode import (
+    MSACutlassDecodeMetadata,
+    MSACutlassSparseDecodeRunner,
+)
 from vllm.v1.attention.backend import AttentionLayer
 
 
 class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
-    """MSA block-sparse attend (``fmha_sm100``); Triton split-K decode."""
+    """MSA block-sparse attention with guarded CUTLASS sparse decode."""
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int | None = None,
+        kv_cache_dtype: str = "auto",
+        *,
+        topk_blocks: int,
+        sparse_block_size: int,
+    ) -> None:
+        super().__init__(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads,
+            kv_cache_dtype,
+            topk_blocks=topk_blocks,
+            sparse_block_size=sparse_block_size,
+        )
+        self.msa_cutlass_sparse_decode = MSACutlassSparseDecodeRunner()
 
     def forward(
         self,
@@ -52,23 +78,46 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
         k_scale = getattr(layer, "_k_scale", None) if self.use_fp8_kv else None
         v_scale = getattr(layer, "_v_scale", None) if self.use_fp8_kv else None
 
-        # Decode [:nd]: Triton split-K placeholder (no MSA decode yet).
+        # Decode [:nd]: opt-in CUTLASS for spec verification, otherwise Triton.
         if main_md.num_decodes > 0:
             d = main_md.decode
             assert d is not None
-            minimax_m3_sparse_attn_decode(
+            msa_metadata = (
+                d.msa_cutlass
+                if isinstance(d.msa_cutlass, MSACutlassDecodeMetadata)
+                else None
+            )
+            used_msa_cutlass = self.msa_cutlass_sparse_decode.try_decode(
                 q[:nd],
                 kv_cache,
-                topk[:nd].transpose(0, 1),
-                d.block_table,
+                topk[:nd],
                 d.seq_lens,
-                self.num_kv_heads,
-                self.scale,
                 out[:nd],
-                d.decode_query_len,
-                k_scale=k_scale,
-                v_scale=v_scale,
+                msa_metadata,
+                num_kv_heads=self.num_kv_heads,
+                scale=self.scale,
+                block_size=self.block_size,
+                topk_blocks=self.topk_blocks,
+                decode_query_len=d.decode_query_len,
+                q_scale=getattr(layer, "_q_scale", None),
+                q_scale_float=getattr(layer, "_q_scale_float", 1.0),
+                k_scale_float=getattr(layer, "_k_scale_float", 1.0),
+                v_scale_float=getattr(layer, "_v_scale_float", 1.0),
             )
+            if not used_msa_cutlass:
+                minimax_m3_sparse_attn_decode(
+                    q[:nd],
+                    kv_cache,
+                    topk[:nd].transpose(0, 1),
+                    d.block_table,
+                    d.seq_lens,
+                    self.num_kv_heads,
+                    self.scale,
+                    out[:nd],
+                    d.decode_query_len,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
 
         # Prefill [nd:]: MSA sparse FMHA over the selected blocks.
         if main_md.num_prefills > 0:

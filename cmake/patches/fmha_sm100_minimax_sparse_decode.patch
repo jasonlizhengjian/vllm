@@ -1,0 +1,128 @@
+diff --git a/python/fmha_sm100/csrc/fmha_sm100_inst.jinja b/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
+--- a/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
++++ b/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
+@@ -47,8 +47,8 @@ cudaError_t {{ func_name }}(const FMHACutlassSM100Params& p) {
+       p.num_qo_heads, p.num_kv_heads,
+       p.head_dim_qk, p.head_dim_vo,
+       p.q_stride_n, p.q_stride_h,
+-      p.k_stride_n, p.k_stride_h,
+-      p.v_stride_n, p.v_stride_h,
++      p.k_stride_n, p.k_stride_h, p.k_stride_t,
++      p.v_stride_n, p.v_stride_h, p.v_stride_t,
+       p.batch_size, p.total_qo_len, p.total_kv_len,
+       effective_max_qo_len,
+       p.qo_offsets_ptr, p.stream,
+diff --git a/python/fmha_sm100/csrc/fmha_sm100_params.h b/python/fmha_sm100/csrc/fmha_sm100_params.h
+--- a/python/fmha_sm100/csrc/fmha_sm100_params.h
++++ b/python/fmha_sm100/csrc/fmha_sm100_params.h
+@@ -32,8 +32,10 @@ struct FMHACutlassSM100Params {
+   int q_stride_h;
+   int k_stride_n;
+   int k_stride_h;
++  int k_stride_t;
+   int v_stride_n;
+   int v_stride_h;
++  int v_stride_t;
+   int batch_size;
+   int total_qo_len;
+   int total_kv_len;
+diff --git a/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja b/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
+--- a/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
++++ b/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
+@@ -82,8 +82,10 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
+   params.q_stride_h = q.stride(1);
+   params.k_stride_n = k.stride(0);
+   params.k_stride_h = k.stride(1);
++  params.k_stride_t = is_paged ? k.stride(2) : k.stride(0);
+   params.v_stride_n = v.stride(0);
+   params.v_stride_h = v.stride(1);
++  params.v_stride_t = is_paged ? v.stride(2) : v.stride(0);
+   params.batch_size = qo_segment_lens.size(0);
+   params.total_qo_len = q.size(0);
+   params.total_kv_len = is_paged ? 0 : k.size(0);
+diff --git a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh b/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
+--- a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
++++ b/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
+@@ -111,7 +111,8 @@ struct FwdRunner {
+                          float sm_scale, float q_scale, float k_scale, float v_scale,
+                          float o_scale, int num_qo_heads, int num_kv_heads, int head_dim_qk,
+                          int head_dim_vo, int q_stride_n, int q_stride_h, int k_stride_n,
+-                         int k_stride_h, int v_stride_n, int v_stride_h, int batch_size,
++                         int k_stride_h, int k_stride_t, int v_stride_n, int v_stride_h,
++                         int v_stride_t, int batch_size,
+                          int total_qo_len, int total_kv_len, int max_qo_len, int* qo_offsets,
+                          cudaStream_t stream,
+                          int num_kv_splits = 1,
+@@ -172,8 +173,8 @@ struct FwdRunner {
+       int k_stride_head = k_stride_h;
+       int v_stride_page = v_stride_n;
+       int v_stride_head = v_stride_h;
+-      stride_K = make_stride(head_dim_qk, _1{}, k_stride_head, k_stride_page);
+-      stride_V = make_stride(_1{}, head_dim_vo, v_stride_head, v_stride_page);
++      stride_K = make_stride(k_stride_t, _1{}, k_stride_head, k_stride_page);
++      stride_V = make_stride(_1{}, v_stride_t, v_stride_head, v_stride_page);
+       auto shape_K = make_shape(KVPageSize, head_dim_qk, num_kv_heads, total_page_num);
+       auto shape_V = make_shape(head_dim_vo, KVPageSize, num_kv_heads, total_page_num);
+ 
+@@ -294,8 +295,8 @@ struct FwdRunner {
+       gpu_trace::teardown(_gt_param, stream);
+       return cudaSuccess;
+     } else {
+-      stride_K = make_stride(k_stride_n, _1{}, make_stride(_0{}, k_stride_h));
+-      stride_V = make_stride(_1{}, v_stride_n, make_stride(_0{}, v_stride_h));
++      stride_K = make_stride(k_stride_t, _1{}, make_stride(_0{}, k_stride_h));
++      stride_V = make_stride(_1{}, v_stride_t, make_stride(_0{}, v_stride_h));
+ 
+       auto shape_Q = make_shape(total_qo_len, head_dim_qk, make_shape(h_r, num_kv_heads));
+       auto shape_O = make_shape(max_qo_len, head_dim_vo,
+@@ -430,7 +431,8 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
+                          double sm_scale, double q_scale, double k_scale, double v_scale,
+                          double o_scale, int num_qo_heads, int num_kv_heads, int head_dim_qk,
+                          int head_dim_vo, int q_stride_n, int q_stride_h, int k_stride_n,
+-                         int k_stride_h, int v_stride_n, int v_stride_h, int batch_size,
++                         int k_stride_h, int k_stride_t, int v_stride_n, int v_stride_h,
++                         int v_stride_t, int batch_size,
+                          int total_qo_len, int total_kv_len, int max_qo_len, int* qo_offsets,
+                          cudaStream_t stream,
+                          int num_kv_splits = 1,
+@@ -460,7 +462,8 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
+       qo_segment_offsets, kv_segment_offsets, packed_work_range,
+       packed_work_info, o, mask_mode_code, sm_scale,
+       q_scale, k_scale, v_scale, o_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo,
+-      q_stride_n, q_stride_h, k_stride_n, k_stride_h, v_stride_n, v_stride_h, batch_size,
++      q_stride_n, q_stride_h, k_stride_n, k_stride_h, k_stride_t,
++      v_stride_n, v_stride_h, v_stride_t, batch_size,
+       total_qo_len, total_kv_len, max_qo_len, qo_offsets, stream,
+       num_kv_splits, kv_tile_begin_indices, kv_tile_end_indices, kv_split_indices,
+       ptr_lse_accum,
+diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
+--- a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
++++ b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
+@@ -227,7 +227,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+                                                  int kv_block_num = 0) {
+     if constexpr (kNeedSparse) {
+       constexpr int tile_kv = get<1>(TileShape{});
+-      return (kv_block_num * KVPageSize + tile_kv - 1) / tile_kv;
++      int kv_len = get<1>(problem_shape);
++      int valid_sparse_blocks = (kv_len + KVPageSize - 1) / KVPageSize;
++      valid_sparse_blocks = min(valid_sparse_blocks, kv_block_num);
++      valid_sparse_blocks = max(valid_sparse_blocks, 1);
++      return (valid_sparse_blocks * KVPageSize + tile_kv - 1) / tile_kv;
+     } else {
+       return Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
+     }
+diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
+--- a/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
++++ b/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
+@@ -343,7 +343,10 @@ struct Sm100FmhaLoadTmaWarpspecialized {
+     int full_trip;
+     if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
+       constexpr int full_tile_kv = get<1>(TileShape{});
+-      full_trip = (params.kv_block_num * KVPageSize + full_tile_kv - 1) / full_tile_kv;
++      int valid_sparse_blocks = (kv_len + KVPageSize - 1) / KVPageSize;
++      valid_sparse_blocks = min(valid_sparse_blocks, params.kv_block_num);
++      valid_sparse_blocks = max(valid_sparse_blocks, 1);
++      full_trip = (valid_sparse_blocks * KVPageSize + full_tile_kv - 1) / full_tile_kv;
+     } else {
+       full_trip = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
+     }

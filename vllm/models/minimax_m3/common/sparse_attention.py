@@ -20,6 +20,7 @@ from typing import ClassVar
 
 import torch
 
+from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
@@ -177,6 +178,7 @@ class MiniMaxM3SparseDecodeMetadata:
     seq_lens: torch.Tensor  # [num_decodes] int32
     block_table: torch.Tensor
     decode_query_len: int
+    msa_cutlass: object | None = None
 
 
 @dataclass
@@ -216,6 +218,17 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        config = vllm_config.model_config.hf_text_config
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self.num_q_heads = config.num_attention_heads // tp_size
+        self.topk_blocks = config.sparse_attention_config["sparse_topk_blocks"]
+        self.msa_cutlass_plan_cache = None
+        if envs.VLLM_MINIMAX_M3_MSA_DECODE_BACKEND == "cutlass":
+            from vllm.models.minimax_m3.nvidia.msa_cutlass_sparse_decode import (
+                MSACutlassDecodePlanCache,
+            )
+
+            self.msa_cutlass_plan_cache = MSACutlassDecodePlanCache()
         # Stable context-length buffer for decode cudagraph replays.
         self.context_len_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
@@ -290,10 +303,30 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
                 (query_lens_cpu == decode_query_len) | (query_lens_cpu == 0)
             )
             assert num_decode_tokens == num_decodes * decode_query_len
+            msa_cutlass = None
+            if (
+                envs.VLLM_MINIMAX_M3_MSA_DECODE_BACKEND == "cutlass"
+                and decode_query_len > 1
+            ):
+                from vllm.models.minimax_m3.nvidia.msa_cutlass_sparse_decode import (
+                    prepare_decode_metadata,
+                )
+
+                msa_cutlass = prepare_decode_metadata(
+                    block_table[:num_decodes],
+                    seq_lens[:num_decodes],
+                    decode_query_len,
+                    num_q_heads=self.num_q_heads,
+                    num_kv_heads=self.kv_cache_spec.num_kv_heads,
+                    page_size=SPARSE_BLOCK_SIZE,
+                    topk_blocks=self.topk_blocks,
+                    plan_cache=self.msa_cutlass_plan_cache,
+                )
             decode_metadata = MiniMaxM3SparseDecodeMetadata(
                 seq_lens=seq_lens[:num_decodes],
                 block_table=block_table[:num_decodes],
                 decode_query_len=decode_query_len,
+                msa_cutlass=msa_cutlass,
             )
 
         return MiniMaxM3SparseMetadata(
