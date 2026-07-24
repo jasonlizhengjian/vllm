@@ -23,8 +23,6 @@ _PAGE_SIZE = 128
 _TOPK = 16
 _MAX_QUERY_HEAD_ROWS = 65536
 _MIN_BATCH_SIZE = 16
-# Query quantization dominates below this static per-rank work threshold.
-_MIN_QUERY_HEAD_ROWS = 2048
 
 
 @dataclass
@@ -211,7 +209,6 @@ def should_prepare_decode_metadata(
         requested()
         and 1 < decode_query_len <= 32
         and batch_size >= _MIN_BATCH_SIZE
-        and total_q * num_q_heads >= _MIN_QUERY_HEAD_ROWS
         and total_q * num_q_heads <= _MAX_QUERY_HEAD_ROWS
         and _supported_head_geometry(num_q_heads, num_kv_heads)
         and page_size == _PAGE_SIZE
@@ -275,8 +272,6 @@ def _static_fallback_reason(
     if query.ndim != 3:
         return "query geometry is unsupported"
     num_q_heads = int(query.shape[1])
-    if total_q * num_q_heads < _MIN_QUERY_HEAD_ROWS:
-        return "query-head rows are below the CUTLASS performance threshold"
     if not _supported_head_geometry(num_q_heads, num_kv_heads):
         return "query and KV head geometry is unsupported"
     if total_q * num_q_heads > _MAX_QUERY_HEAD_ROWS:

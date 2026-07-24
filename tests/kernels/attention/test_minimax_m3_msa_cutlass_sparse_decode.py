@@ -44,10 +44,11 @@ SM_SCALE = HEAD_DIM**-0.5
     [
         pytest.param(8, 4, 64, 4, False, id="tp1-below-min-batch"),
         pytest.param(16, 4, 64, 4, True, id="tp1-supported"),
-        pytest.param(16, 4, 16, 1, False, id="tp4-below-min-work"),
+        pytest.param(16, 4, 16, 1, True, id="tp4-min-batch"),
+        pytest.param(24, 4, 16, 1, True, id="tp4-intermediate-batch"),
         pytest.param(32, 4, 16, 1, True, id="tp4-supported"),
         pytest.param(16, 2, 64, 4, True, id="tp1-query-len-2"),
-        pytest.param(16, 2, 16, 1, False, id="tp4-query-len-2-below-min-work"),
+        pytest.param(16, 2, 16, 1, True, id="tp4-query-len-2"),
     ],
 )
 def test_msa_cutlass_decode_static_dispatch(
