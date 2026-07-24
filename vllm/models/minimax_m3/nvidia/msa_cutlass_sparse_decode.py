@@ -22,6 +22,7 @@ _HEAD_DIM = 128
 _PAGE_SIZE = 128
 _TOPK = 16
 _MAX_QUERY_HEAD_ROWS = 65536
+_MIN_BATCH = 16
 
 
 @dataclass
@@ -234,6 +235,8 @@ def _static_fallback_reason(
         return "GPU is not SM100 or SM103"
     batch = int(seq_lens.shape[0])
     total_q = batch * decode_query_len
+    if batch < _MIN_BATCH:
+        return f"batch size is below {_MIN_BATCH}"
     if not 1 < decode_query_len <= 32:
         return "decode query length is outside [2, 32]"
     if total_q * _NUM_Q_HEADS > _MAX_QUERY_HEAD_ROWS:

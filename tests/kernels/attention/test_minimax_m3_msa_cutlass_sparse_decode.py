@@ -13,7 +13,9 @@ from vllm.models.minimax_m3.common.ops.sparse_attn import (
 )
 from vllm.models.minimax_m3.nvidia.msa_cutlass_sparse_decode import (
     MSACutlassDecodePlanCache,
+    MSACutlassDecodeMetadata,
     MSACutlassSparseDecodeRunner,
+    _static_fallback_reason,
     prepare_decode_metadata,
 )
 from vllm.platforms import current_platform
@@ -32,6 +34,30 @@ BLOCK_SIZE = 128
 TOPK = 16
 QUERY_LEN = 4
 SM_SCALE = HEAD_DIM**-0.5
+
+
+def test_msa_cutlass_decode_falls_back_for_small_batches(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_MINIMAX_M3_MSA_DECODE_BACKEND", "cutlass")
+    query = torch.empty(1, device="cuda")
+    seq_lens = torch.empty(8, dtype=torch.int32, device="cuda")
+
+    reason = _static_fallback_reason(
+        query,
+        query,
+        query,
+        seq_lens,
+        query,
+        MSACutlassDecodeMetadata(plan=None, page_table=query),
+        num_kv_heads=NUM_KV_HEADS,
+        block_size=BLOCK_SIZE,
+        topk_blocks=TOPK,
+        decode_query_len=QUERY_LEN,
+        q_scale=None,
+    )
+
+    assert reason == "batch size is below 16"
 
 
 def _make_topk(seq_lens: list[int]) -> torch.Tensor:
@@ -57,7 +83,7 @@ def test_msa_cutlass_decode_matches_triton_with_interleaved_cache(
 ):
     monkeypatch.setenv("VLLM_MINIMAX_M3_MSA_DECODE_BACKEND", "cutlass")
     torch.manual_seed(0)
-    seq_lens_list = [257, 513]
+    seq_lens_list = [257, 513] * 8
     seq_lens_cpu = torch.tensor(seq_lens_list, dtype=torch.int32)
     seq_lens = seq_lens_cpu.cuda()
     pages_per_request = [math.ceil(seq_len / BLOCK_SIZE) for seq_len in seq_lens_list]
@@ -165,7 +191,7 @@ def test_msa_cutlass_decode_matches_triton_with_interleaved_cache(
     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
 
     # The same captured plan must remain correct as ragged lengths change.
-    updated_seq_lens_list = [129, 385]
+    updated_seq_lens_list = [129, 385] * 8
     seq_lens.copy_(
         torch.tensor(updated_seq_lens_list, dtype=torch.int32, device="cuda")
     )
@@ -235,7 +261,7 @@ def test_msa_cutlass_decode_matches_triton_with_interleaved_cache(
             v_scale_float=1.0,
         )
 
-    replay_seq_lens_list = [257, 513]
+    replay_seq_lens_list = [257, 513] * 8
     seq_lens.copy_(torch.tensor(replay_seq_lens_list, dtype=torch.int32, device="cuda"))
     topk_token_major.copy_(_make_topk(replay_seq_lens_list))
     prepare_decode_metadata(
