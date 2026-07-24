@@ -19,6 +19,10 @@ else()
     GIT_REPOSITORY https://github.com/vllm-project/MSA.git
     GIT_TAG 890aaa1a37a598ad17ccff0827fea21540d381fa
     GIT_PROGRESS TRUE
+    PATCH_COMMAND
+      ${CMAKE_COMMAND} -E chdir <SOURCE_DIR>
+      git apply
+      ${CMAKE_CURRENT_LIST_DIR}/../patches/fmha_sm100_minimax_sparse_decode.patch
     CONFIGURE_COMMAND ""
     BUILD_COMMAND ""
   )
