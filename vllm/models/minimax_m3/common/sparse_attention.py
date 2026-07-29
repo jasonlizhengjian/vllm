@@ -304,10 +304,7 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
             )
             assert num_decode_tokens == num_decodes * decode_query_len
             msa_cutlass = None
-            if (
-                envs.VLLM_MINIMAX_M3_MSA_DECODE_BACKEND == "cutlass"
-                and decode_query_len > 1
-            ):
+            if envs.VLLM_MINIMAX_M3_MSA_DECODE_BACKEND == "cutlass":
                 from vllm.models.minimax_m3.nvidia.msa_cutlass_sparse_decode import (
                     prepare_decode_metadata,
                 )

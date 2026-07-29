@@ -237,8 +237,8 @@ def _static_fallback_reason(
     total_q = batch * decode_query_len
     if batch < _MIN_BATCH:
         return f"batch size is below {_MIN_BATCH}"
-    if not 1 < decode_query_len <= 32:
-        return "decode query length is outside [2, 32]"
+    if not 1 <= decode_query_len <= 32:
+        return "decode query length is outside [1, 32]"
     if total_q * _NUM_Q_HEADS > _MAX_QUERY_HEAD_ROWS:
         return "total query-head rows exceed the CUTLASS planner limit"
     if (
